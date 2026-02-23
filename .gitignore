@@ -1,0 +1,31 @@
+# Data files (large)
+data/
+!data/README.md
+
+# Generated outputs
+issue55/output/
+issue65/output/
+
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
