@@ -12,7 +12,7 @@ dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
 # Load data
 cat("Loading geo_metadata.parquet...\n")
-dt <- as.data.table(read_parquet("../../data/geo_metadata.parquet"))
+dt <- as.data.table(read_parquet("../data/geo_metadata.parquet"))
 cat(sprintf("Loaded %d rows, %d columns\n", nrow(dt), ncol(dt)))
 
 # --- Parse submission dates ---

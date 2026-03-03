@@ -18,7 +18,8 @@ from sentence_transformers import SentenceTransformer
 load_dotenv()
 
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-BATCH_SIZE = 512
+# BATCH_SIZE = 512
+BATCH_SIZE = 8
 INPUT_FILE = "../../data/geo_text_for_embedding.parquet"
 OUTPUT_FILE = "../../data/geo_embeddings.parquet"
 DEVICE = "mps"  # Apple Silicon GPU
