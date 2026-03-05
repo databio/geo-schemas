@@ -1,11 +1,12 @@
 import json
 import sys
-import time
+import re
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import re
 from tqdm import tqdm
+
 
 HERE = Path(__file__).parent
 VOCAB_PATH = HERE / "../../output/column_values_vocab.json"
@@ -13,83 +14,49 @@ OUTPUT_PATH = HERE / "../../output/onto_map.json"
 
 OLS_SEARCH_URL = "https://www.ebi.ac.uk/ols4/api/search"
 
-# Preferred ontology per column; None = search all loaded ontologies
-# COLUMN_ONTOLOGY: dict[str, str | None] = {
-#     "tissue": "uberon",
-#     "cell_type": "cl",
-#     "cell_line": "efo",
-#     "strain": None,
-#     "antibody": "pr",
-#     "disease": "mondo",
-# }
+COLUMN_ONTOLOGY: dict[str, str | None] = {
+    "tissue": "uberon,bto,ma,emapa,fma,hra,ccf,caro,ehdaa2",
+    "cell_type": "cl,pcl,hcao,bto",
+    "cell_line": "clo,bto,efo",
+    "strain": "rs,ncbitaxon,vbo",
+    "antibody": "obi,efo,ncit",
+    "disease": "doid,mondo,ado,epio,cvdo,scdo,cido,ido,idomal,idocovid19,mfomd,ordo,ogms,ncit,htn,symp,hp"
+}
+
+MAX_WORKERS = 16
+ROWS = 50
 
 
 def _normalize(text: str) -> str:
-    """Lowercase and collapse whitespace/hyphens/underscores for loose comparison."""
     return re.sub(r"[\s\-_]+", "", text.strip().lower())
 
 
-def _query_ols(
-    term: str,
-    ontology: str | None,
-    exact: bool,
-    rows: int,
-    retries: int = 3,
-    backoff: float = 2.0,
-) -> list[dict]:
-    params: dict = {"q": term, "rows": rows, "exact": str(exact).lower()}
+def _query_ols(session: requests.Session, term: str, ontology: str | None) -> list[dict]:
+    params = {"q": term, "rows": ROWS, "exact": "false"}
     if ontology:
         params["ontology"] = ontology
-    for attempt in range(retries):
-        try:
-            resp = requests.get(OLS_SEARCH_URL, params=params, timeout=10)
-            resp.raise_for_status()
-            return resp.json().get("response", {}).get("docs", [])
-        except (requests.RequestException, ValueError):
-            if attempt == retries - 1:
-                raise
-            time.sleep(backoff * (attempt + 1))
-    return []
+
+    resp = session.get(OLS_SEARCH_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("response", {}).get("docs", [])
 
 
-def check_ontology_term(
-    term: str,
-    ontology: str | None = None,
-    rows: int = 50,
-) -> dict:
-    """
-    Classify a term against OLS ontologies into one of three statuses.
-
-    Status values
-    -------------
-    "exact"        : term is the canonical label of an ontology concept
-    "mappable"     : term is a known synonym / alternate form of a concept,
-                     or is close enough that OLS returns a confident hit
-    "not_mappable" : no ontology concept found
-
-    Parameters
-    ----------
-    term : str
-        Input term to look up.
-    ontology : str or None
-        Restrict to a specific ontology short name (e.g. "efo", "cl", "uberon").
-        None searches across all loaded ontologies.
-    rows : int
-        Max candidates retrieved per OLS query.
-
-    Returns
-    -------
-    dict
-        status        : "exact" | "mappable" | "not_mappable"
-        match_type    : "label" | "synonym" | "fuzzy" | None
-        matched_label : canonical ontology label of the best match, or None
-        ontology_id   : e.g. "EFO:0000400", or None
-        iri           : full term IRI, or None
-    """
+def check_ontology_term(session: requests.Session, term: str, ontology: str | None):
     term_norm = _normalize(term)
 
-    # Pass 1: OLS server-side exact match — fast, hits only canonical labels
-    for doc in _query_ols(term, ontology, exact=True, rows=rows):
+    docs = _query_ols(session, term, ontology)
+
+    if not docs:
+        return {
+            "status": "not_mappable",
+            "match_type": None,
+            "matched_label": None,
+            "ontology_id": None,
+            "iri": None,
+        }
+
+    # label match
+    for doc in docs:
         if _normalize(doc.get("label", "")) == term_norm:
             return {
                 "status": "exact",
@@ -99,20 +66,10 @@ def check_ontology_term(
                 "iri": doc.get("iri"),
             }
 
-    # Pass 2: broad query — scan synonyms for non-standard / alternate forms
-    broad_docs = _query_ols(term, ontology, exact=False, rows=rows)
-    if not broad_docs:
-        return {
-            "status": "not_mappable",
-            "match_type": None,
-            "matched_label": None,
-            "ontology_id": None,
-            "iri": None,
-        }
-
-    for doc in broad_docs:
+    # synonym match
+    for doc in docs:
         synonyms = doc.get("synonym") or []
-        if any(_normalize(syn) == term_norm for syn in synonyms):
+        if any(_normalize(s) == term_norm for s in synonyms):
             return {
                 "status": "mappable",
                 "match_type": "synonym",
@@ -121,8 +78,8 @@ def check_ontology_term(
                 "iri": doc.get("iri"),
             }
 
-    # OLS returned results but term didn't normalize-match any label or synonym
-    best = broad_docs[0]
+    # fuzzy
+    best = docs[0]
     return {
         "status": "mappable",
         "match_type": "fuzzy",
@@ -132,59 +89,62 @@ def check_ontology_term(
     }
 
 
-DELAY = 0.1  # seconds between OLS requests
+def worker(session, col, term, ontology):
+    try:
+        mapping = check_ontology_term(session, term, ontology)
+    except Exception as exc:
+        tqdm.write(f"ERROR [{col}] {term!r}: {exc}", file=sys.stderr)
+        mapping = {
+            "status": "error",
+            "match_type": None,
+            "matched_label": None,
+            "ontology_id": None,
+            "iri": None,
+        }
+
+    return col, term, mapping
 
 
-def main() -> None:
+def main():
     vocab: dict[str, dict[str, int]] = json.loads(VOCAB_PATH.read_text())
 
-    # Load existing results so we can resume interrupted runs
     results: dict[str, dict[str, dict]] = {}
     if OUTPUT_PATH.exists():
         results = json.loads(OUTPUT_PATH.read_text())
-        print(f"Resuming from {OUTPUT_PATH} ({sum(len(v) for v in results.values())} terms already done).")
+        print(f"Resuming from {OUTPUT_PATH}")
 
+    session = requests.Session()
+
+    tasks = []
     for col, values in vocab.items():
-        # ontology = COLUMN_ONTOLOGY.get(col)
-        all_terms = list(values.keys())
-        already_done = results.get(col, {})
-        pending = [t for t in all_terms if t not in already_done]
+        ontology = COLUMN_ONTOLOGY.get(col)
+        results.setdefault(col, {})
 
-        if not pending:
-            print(f"[{col}] all {len(all_terms)} terms already mapped — skipping.")
-            continue
+        for term in values:
+            if term not in results[col]:
+                tasks.append((col, term, ontology))
 
-        col_results = dict(already_done)
-        status_counts: dict[str, int] = {}
+    print(f"Total terms to process: {len(tasks)}")
 
-        with tqdm(pending, desc=col, unit="term", initial=len(already_done), total=len(all_terms)) as pbar:
-            for term in pbar:
-                try:
-                    mapping = check_ontology_term(term)
-                except Exception as exc:
-                    tqdm.write(f"ERROR [{col}] {term!r}: {exc}", file=sys.stderr)
-                    mapping = {
-                        "status": "error",
-                        "match_type": None,
-                        "matched_label": None,
-                        "ontology_id": None,
-                        "iri": None,
-                    }
+    status_counts = {}
 
-                col_results[term] = mapping
-                status_counts[mapping["status"]] = status_counts.get(mapping["status"], 0) + 1
-                pbar.set_postfix(status_counts)
+    with ThreadPoolExecutor(MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(worker, session, col, term, ontology)
+            for col, term, ontology in tasks
+        ]
 
-                time.sleep(DELAY)
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            col, term, mapping = future.result()
 
-        results[col] = col_results
+            results[col][term] = mapping
+            status_counts[mapping["status"]] = status_counts.get(mapping["status"], 0) + 1
 
-        # Write after each column so progress is preserved on interruption
-        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OUTPUT_PATH.write_text(json.dumps(results, indent=2, ensure_ascii=False))
-        print(f"  Saved → {OUTPUT_PATH}")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
-    print("\nDone.")
+    print("\nStatus counts:", status_counts)
+    print("Saved →", OUTPUT_PATH)
 
 
 if __name__ == "__main__":
